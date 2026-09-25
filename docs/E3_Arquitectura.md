@@ -2,90 +2,59 @@
 
 ## 1. Diagrama de Arquitectura
 
-```mermaid
-graph TD
-    %% Fuentes de Datos
-    subgraph Fuentes Transaccionales
-        SQL_Norte[(SQL Server<br>IPS Norte)]
-        SQL_Sur[(SQL Server<br>IPS Sur)]
-        SQL_Occ[(SQL Server<br>IPS Occidente)]
-        Mongo[(MongoDB<br>Eventos WhatsApp)]
-    end
-
-    %% Ingesta
-    subgraph Ingesta - Azure Data Factory / Fabric Pipelines
-        ADF[Data Factory Pipelines<br>Extracción Incremental]
-    end
-
-    %% Capas OneLake (Medallion Architecture)
-    subgraph Microsoft Fabric OneLake
-        subgraph Bronze Layer [Capa Bronze / Cruda]
-            Delta_B[(Archivos Delta<br>Datos Originales)]
-        end
-        
-        subgraph Silver Layer [Capa Silver / Limpia]
-            Delta_S[(Modelo Canónico<br>Calidad y Homologación)]
-            Hash[Enmascaramiento<br>de PII]
-        end
-        
-        subgraph Gold Layer [Capa Gold / Consumo]
-            Fact_Citas[(Hechos Citas)]
-            Dim_Pacientes[(Dim Pacientes)]
-            Dim_IPS[(Dim IPS)]
-        end
-    end
-
-    %% Consumo y Exposición
-    subgraph Capa Semántica y Consumo
-        PowerBI[Power BI<br>Tableros Gerenciales]
-        RLS[Row/Column Level Security]
-        ML[Modelos Predictivos<br>Azure ML / Fabric Data Science]
-        Agents[Agentes IA<br>Semantic Link]
-    end
-
-    %% Flujos
-    SQL_Norte --> ADF
-    SQL_Sur --> ADF
-    SQL_Occ --> ADF
-    Mongo --> ADF
-    ADF -->|Append Only| Delta_B
-    Delta_B -->|Transformación Spark| Delta_S
-    Delta_S -->|Star Schema| Gold Layer
-    Gold Layer --> RLS
-    RLS --> PowerBI
-    Gold Layer --> ML
-    Gold Layer --> Agents
-```
+![Diagrama de Arquitectura](img/arquitectura.png)
 
 ## 2. Documento de Decisiones Arquitectónicas
 
 ### A. Ingesta sin afectar la operación
-* **SQL Server:** Se implementará un patrón de **Ingesta Incremental (Change Data Capture - CDC)** si está habilitado en las bases de datos de origen, o en su defecto, ingesta por marca de agua (Watermarking) basada en la columna `fecha_actualizacion`. La extracción se programará en ventanas de bajo tráfico operativo (madrugada).
-* **MongoDB:** Se utilizará un conector nativo en Fabric/ADF con lectura paginada sobre índices (ej. filtrando por timestamp de evento) o leyendo directamente de un nodo secundario (réplica) del cluster de MongoDB para asegurar que no haya bloqueo de lectura/escritura en la base de datos principal.
+Para garantizar que las cargas analíticas no degraden el rendimiento de los sistemas transaccionales de las IPS (OLTP), definimos los siguientes patrones:
+* **SQL Server (IPS Norte, Sur, Occidente):** Se implementará un patrón de **Ingesta Incremental (Change Data Capture - CDC)** soportado nativamente en Azure Data Factory / Fabric Pipelines. De no ser posible activar CDC en la fuente por políticas del cliente, se implementará una ingesta por marca de agua (Watermarking) basada en la columna de auditoría `fecha_actualizacion`. Las extracciones (`Extracciones` en el diagrama) se programarán en ventanas de mantenimiento nocturnas o de bajo tráfico.
+* **MongoDB (Eventos WhatsApp):** Se utilizará el conector nativo de Fabric Data Factory hacia MongoDB. Para asegurar que no haya bloqueos (locks) de lectura/escritura en la base de datos principal, la conexión apuntará estrictamente a un **nodo secundario (réplica de lectura)** del clúster de MongoDB.
 
-### B. Organización por capas y Modelo Canónico multi-cliente
-Implementaremos una **Arquitectura Medallón sobre OneLake (Formato Delta Parquet)**:
-* **Bronze (Cruda):** Tablas anexas por cliente que respetan el esquema original al 100%. Los datos entran como "append-only".
-* **Silver (Limpia - Modelo Canónico):** Un pipeline de Spark/SQL lee de Bronze y aplica homologación. Aunque los clientes tengan diferentes columnas (ej. `id_cita` vs `cita_id`), el código de transformación mapea todo a una tabla central `citas_silver` que tiene la estructura del diccionario canónico. Aquí se resuelven tipos de datos y se filtran duplicados técnicos.
-* **Gold (Consumo):** Modelado Dimensional (Estrella) agrupando hechos (Citas) y dimensiones (IPS, Pacientes, Tiempo).
+### B. Organización por capas y Modelo Canónico Multi-cliente
+Implementamos una **Arquitectura Medallón sobre OneLake (Formato Delta Parquet)**, orquestada mediante Fabric Pipelines y separada lógicamente por Workspaces según entornos (`{ENV}`: DEV, QA, PRD) y dominios de negocio (`{DOMINIO NEGOCIO}` y `{DOMINIO DATO}`).
 
-### C. Visibilidad y Seguridad de PII
-1. **Column-Level Security (CLS) y Enmascaramiento:** En el paso de Bronze a Silver, columnas como `documento_identidad` y `telefono` pasan por una función de Hashing unidireccional (SHA-256) con un "salting" seguro resguardado en Azure Key Vault. Nadie, excepto procesos estrictamente autorizados, ve el PII crudo.
-2. **Row-Level Security (RLS) Multi-tenant:** En la capa Semántica (Direct Lake / Gold), se implementará RLS usando la dimensión de IPS (ej. `WHERE ips_id = user_principal_ips`). Así, cuando un usuario de la IPS Norte ingrese a Power BI, el motor filtra a bajo nivel y solo visualizará datos de la IPS Norte.
+1. **Capa Bronze (`lh_brz_<d_neg>_<d_dat>`):** 
+   - Alojada en el Lakehouse de Bronze.
+   - Naturaleza *Append-Only*. Los datos de cada cliente aterrizan en bruto, manteniendo el 100% de la fidelidad del esquema original (ej. `id_cita` para Occidente, `cita_id` para Norte).
+2. **Capa Silver (`lh_slv_<d_neg>_<d_dat>`):** 
+   - Procesamiento mediante Notebooks de Spark en Fabric.
+   - Aquí reside el **Modelo Canónico**. El código Spark aplica diccionarios de homologación dinámicos para estandarizar los esquemas dispares de las IPS hacia una estructura unificada de citas.
+   - Se ejecutan rutinas de deduplicación y resolución de tipos de datos.
+3. **Capa Gold (`dw_gld_<d_neg>_<d_dat>`):** 
+   - Alojada en un Workspace separado (`-gld`) para aislar los cómputos de consumo.
+   - Modelado Dimensional (Kimball): Tablas de Hechos (Fact_Citas) y Dimensiones (Dim_Pacientes, Dim_IPS). 
+   - Optimizado para consultas interactivas mediante el SQL Endpoint de Fabric.
+
+### C. Visibilidad, Gobierno y Seguridad de PII
+El gobierno de datos es transversal a la plataforma, soportado por la suite de Microsoft:
+* **Seguridad de Acceso (Microsoft Entra ID):** Control de acceso basado en roles (RBAC) a nivel de Workspace.
+* **Gobierno y Linaje (Microsoft Purview):** Clasificación automática de datos sensibles y trazabilidad de linaje desde SQL Server hasta Power BI.
+* **Gestión de Secretos (Azure Key Vault):** Las cadenas de conexión a las IPS nunca residen en código; se consumen dinámicamente desde el Key Vault.
+* **Enmascaramiento de PII:** En el paso de Bronze a Silver, columnas sensibles (como `documento_identidad` y `telefono`) sufren un Hashing unidireccional (SHA-256) con un *salt* resguardado en Key Vault.
+* **Row-Level Security (RLS) Multi-tenant:** En la capa Gold y Power BI, implementamos políticas RLS basadas en la identidad del usuario (Entra ID) mapeada a la dimensión de IPS, asegurando que un gerente de la IPS Sur no pueda consultar registros de la IPS Norte.
 
 ### D. Estimación de Capacidad, Costos y Manejo de Cargas Pesadas
-* **Supuestos:** Volúmenes actuales son bajos en el piloto (millares), pero escalando a decenas de IPS, estimamos 10 GB diarios de nueva data cruda y consultas recurrentes.
-* **Costo / Capacidad:** En Fabric, esto se gestiona mediante "Capacidades" (SKUs F). Para arrancar, un SKU F2 o F8 (pago por uso) será suficiente, oscilando entre ~$250 a $1,000 USD/mes.
-* **Aislamiento de Cargas (Workload Isolation):** Para evitar que el entrenamiento de un modelo de IA pesado afecte los dashboards de gerencia, en Fabric aprovecharemos la separación de Cómputo y Almacenamiento. OneLake es la base común, pero el SQL Endpoint (usado por Power BI) y los Spark Pools (usados para transformación y ML) utilizan nodos de cómputo independientes bajo la misma capacidad, pero priorizables mediante Workload Management (WLM) para dar prioridad de recursos a las consultas interactivas de Power BI.
+* **Supuestos:** Aunque el piloto maneja decenas de miles de registros, la arquitectura está diseñada para escalar a cientos de IPS (millones de registros diarios).
+* **Capacidad Fabric (SKUs F):** Para el arranque, proponemos un SKU F2 o F8 (pago por uso / reserva), oscilando entre $250 y $1,000 USD mensuales, lo cual incluye cómputo de Spark, Data Factory y Power BI Premium.
+* **Aislamiento de Cargas (Workload Isolation):** Uno de los mayores riesgos es que un modelo de Machine Learning consuma toda la capacidad, tumbando los tableros gerenciales. Lo evitamos de dos formas:
+   1. **Workspaces separados:** La capa Gold (consumo) vive en su propio Workspace.
+   2. **Separación de Cómputo (OneLake):** Los ingenieros y científicos de datos leen los datos delta directamente de OneLake mediante los Spark Pools (para entrenamiento), sin tocar el SQL Endpoint que Power BI usa para servir los dashboards.
 
 ### E. Ambientes de Desarrollo, Pruebas y Producción
-Utilizaremos **Workspaces separados** en Fabric (WS_Dev, WS_Test, WS_Prod), controlados por **Git Integration** (Azure DevOps o GitHub) y Fabric Deployment Pipelines. 
-* Los desarrolladores usarán repositorios de código para las notebooks de Spark y definiciones de SQL. 
-* Los datos crudos en WS_Dev serán un muestreo anonimizado, no la base completa, para evitar fugas de datos en desarrollo.
+Adoptamos un enfoque estricto de CI/CD:
+* Los nombres de los Workspaces incluyen el sufijo `{ENV}` (DEV, QA, PRD).
+* Todo el código (Notebooks, Pipelines, SQL) se versiona en **Azure DevOps**.
+* Los despliegues entre entornos se realizan mediante los *Deployment Pipelines* de Fabric.
+* El entorno de DEV opera sobre datos sintéticos o un subconjunto altamente ofuscado; los desarrolladores jamás tocan datos reales de producción (PRD).
 
-### F. Consumo de Modelos de IA de forma Trazable
-Los modelos y agentes accederán a los datos mediante la capa Gold utilizando **Semantic Link** de Microsoft Fabric. Esto permite que los notebooks de Python lean directamente las métricas gobernadas (el ausentismo oficial) sin tener que recalcularlas en el código. Las predicciones del modelo se guardarán como una tabla "Fact_Predicciones" de vuelta en OneLake, permitiendo que Power BI cruce lo que el modelo predijo versus lo que realmente sucedió, habilitando un bucle de monitoreo de ML (MLOps) y trazabilidad completa.
+### F. Consumo de Modelos de IA de forma Trazable (Azure Machine Learning)
+Para habilitar modelos predictivos (ej. predicción de ausentismo), la arquitectura se extiende hacia servicios especializados:
+* **Entrenamiento:** Los científicos de datos utilizan **Azure Machine Learning (AML)** conectado nativamente a los datos de la capa Gold en OneLake (vía atajos/shortcuts). Esto permite entrenar modelos (XGBoost, Random Forest) con un seguimiento estricto de experimentos y registro de modelos en el *Model Registry* de AML.
+* **Inferencia y Despliegue:** El modelo entrenado se expone como un **Managed Endpoint** en Azure ML.
+* **Consumo Trazable:** Fabric Data Factory consume este endpoint mediante llamadas batch, inyectando la probabilidad de inasistencia en una nueva Fact Table (`Fact_Predicciones`) en la capa Gold, permitiendo cruzar la predicción vs la realidad en Power BI.
+* **Visión a Futuro (Azure AI Foundry):** En una fase 2, integraremos **Azure AI Foundry** para evolucionar de la analítica predictiva a la Inteligencia Artificial Generativa. Mediante agentes conversacionales RAG (Retrieval-Augmented Generation) conectados al modelo semántico de Fabric, permitiremos que las IPS consulten su ausentismo interactuando en lenguaje natural ("¿Cuál fue mi tasa de inasistencia la semana pasada?"), manteniendo siempre las políticas de RLS.
 
 ### G. Qué NO haríamos en Fabric y por qué
 **No usaríamos Fabric como base de datos transaccional (OLTP) ni como backend para la aplicación de agendamiento en tiempo real.**
-* **Por qué:** Fabric (y OneLake) está diseñado nativamente para cargas de trabajo analíticas (OLAP), procesando grandes volúmenes de datos orientados a columnas (Parquet/Delta). Intentar que DonDoctor conecte su aplicación web o WhatsApp bot directamente a Fabric para insertar una cita una a una con latencia de milisegundos y consistencia ACID inmediata sería un desastre de rendimiento y costo. Para la operación se debe mantener SQL Server / MongoDB, y Fabric se reserva para el análisis de esos datos.
+* **Por qué:** Microsoft Fabric (y OneLake con su formato Parquet/Delta) está diseñado nativamente para cargas de trabajo analíticas (OLAP). Intentar que la aplicación de DonDoctor o su bot de WhatsApp inserte o actualice citas una a una directamente en Fabric con latencia de milisegundos sería un desastre arquitectónico, degradando el rendimiento y disparando los costos. Los sistemas transaccionales (SQL Server/Mongo) son los dueños de la operación; Fabric es el cerebro para analizarla.
