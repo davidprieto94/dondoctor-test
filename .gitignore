@@ -1,0 +1,17 @@
+# Datos (no deben subirse al repositorio)
+/dataset/
+/data/
+*.csv
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
